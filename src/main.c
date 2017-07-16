@@ -37,6 +37,7 @@
 #include "output.h"             /* for outputing results */
 #include "rte-ring.h"           /* producer/consumer ring buffer */
 #include "rawsock-pcapfile.h"   /* for saving pcap files w/ raw packets */
+#include "rawsock-pcap.h"       /* dynamically load libpcap library */
 #include "smack.h"              /* Aho-corasick state-machine pattern-matcher */
 #include "pixie-timer.h"        /* portable time functions */
 #include "pixie-threads.h"      /* portable threads */
@@ -400,7 +401,7 @@ infinite:
                 port_me = src_port;
             }
             cookie = syn_cookie(ip_them, port_them, ip_me, port_me, entropy);
-//printf("0x%08x 0x%08x 0x%04x 0x%08x 0x%04x    \n", cookie, ip_them, port_them, ip_me, port_me);
+
             /*
              * SEND THE PROBE
              *  This is sorta the entire point of the program, but little
@@ -471,8 +472,6 @@ infinite:
      * Wait until the receive thread realizes the scan is over
      */
     LOG(1, "THREAD: xmit done, waiting for receive thread to realize this\n");
-    /*while (!is_tx_done)
-        pixie_mssleep(1);*/
 
     /*
      * We are done transmitting. However, response packets will take several
@@ -758,8 +757,6 @@ receive_thread(void *v)
         /* verify: my IP address */
         if (!is_my_ip(&parms->src, ip_me))
             continue;
-//printf("0x%08x 0x%08x 0x%04x 0x%08x 0x%04x    \n", cookie, ip_them, port_them, ip_me, port_me);
-
 
         /*
          * Handle non-TCP protocols
@@ -943,6 +940,7 @@ receive_thread(void *v)
             if (dedup_is_duplicate(dedup, ip_them, port_them, ip_me, port_me))
                 continue;
 
+            /* keep statistics on number received */
             if (TCP_IS_SYNACK(px, parsed.transport_offset))
                 (*status_synack_count)++;
 
@@ -965,7 +963,7 @@ receive_thread(void *v)
              * Send RST so other side isn't left hanging (only doing this in
              * complete stateless mode where we aren't tracking banners)
              */
-            if (tcpcon == NULL)
+            if (tcpcon == NULL && !masscan->is_noreset)
                 tcp_send_RST(
                     &parms->tmplset->pkts[Proto_TCP],
                     parms->packet_buffers,
@@ -1059,16 +1057,19 @@ main_scan(struct Masscan *masscan)
      */
     if (masscan->script.name) {
         unsigned i;
+		unsigned is_error;
         script = script_lookup(masscan->script.name);
         
         /* If no ports specified on command-line, grab default ports */
+        is_error = 0;
         if (rangelist_count(&masscan->ports) == 0)
-            rangelist_parse_ports(&masscan->ports, script->ports, 0);
+            rangelist_parse_ports(&masscan->ports, script->ports, &is_error);
         
         /* Kludge: change normal port range to script range */
         for (i=0; i<masscan->ports.count; i++) {
             struct Range *r = &masscan->ports.list[i];
             r->begin = (r->begin&0xFFFF) | Templ_Script;
+            r->end = (r->end & 0xFFFF) | Templ_Script;
         }
     }
     
@@ -1262,10 +1263,22 @@ main_scan(struct Masscan *masscan)
         gmtime_s(&x, &now);
         strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S GMT", &x);
         LOG(0, "\nStarting masscan " MASSCAN_VERSION " (http://bit.ly/14GZzcT) at %s\n", buffer);
-        LOG(0, " -- forced options: -sS -Pn -n --randomize-hosts -v --send-eth\n");
-        LOG(0, "Initiating SYN Stealth Scan\n");
-        LOG(0, "Scanning %u hosts [%u port%s/host]\n",
-            (unsigned)count_ips, (unsigned)count_ports, (count_ports==1)?"":"s");
+
+        if (count_ports == 1 && \
+            masscan->ports.list->begin == Templ_ICMP_echo && \
+            masscan->ports.list->end == Templ_ICMP_echo)
+            { /* ICMP only */
+                LOG(0, " -- forced options: -sn -n --randomize-hosts -v --send-eth\n");
+                LOG(0, "Initiating ICMP Echo Scan\n");
+                LOG(0, "Scanning %u hosts\n",(unsigned)count_ips);
+             }
+        else /* This could actually also be a UDP only or mixed UDP/TCP/ICMP scan */
+            {
+                LOG(0, " -- forced options: -sS -Pn -n --randomize-hosts -v --send-eth\n");
+                LOG(0, "Initiating SYN Stealth Scan\n");
+                LOG(0, "Scanning %u hosts [%u port%s/host]\n",
+                    (unsigned)count_ips, (unsigned)count_ports, (count_ports==1)?"":"s");
+            }
     }
 
     /*
@@ -1435,7 +1448,7 @@ int main(int argc, char *argv[])
 {
     struct Masscan masscan[1];
     unsigned i;
-
+    
     usec_start = pixie_gettime();
 #if defined(WIN32)
     {WSADATA x; WSAStartup(0x101, &x);}
@@ -1506,6 +1519,8 @@ int main(int argc, char *argv[])
 
     /* We need to do a separate "raw socket" initialization step. This is
      * for Windows and PF_RING. */
+    if (pcap_init() != 0)
+        LOG(2, "libpcap: failed to load\n");
     rawsock_init();
 
     /* Init some protocol parser data structures */
